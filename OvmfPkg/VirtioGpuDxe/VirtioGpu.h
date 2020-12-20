@@ -14,6 +14,8 @@
 #include <IndustryStandard/VirtioGpu.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/DebugLib.h>
+#include <Library/FrameBufferBltLib.h>
+#include <Library/QemuFwCfgLib.h>
 #include <Library/UefiLib.h>
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/VirtioDevice.h>
@@ -22,6 +24,8 @@
 // Forward declaration of VGPU_GOP.
 //
 typedef struct VGPU_GOP_STRUCT VGPU_GOP;
+
+typedef struct RAMFB_GOP_STRUCT RAMFB_GOP;
 
 //
 // The abstraction that directly corresponds to a Virtio GPU device.
@@ -157,6 +161,14 @@ struct VGPU_GOP_STRUCT {
   //
   UINT32                                  NativeXRes;
   UINT32                                  NativeYRes;
+
+  //
+  // RAMFB support
+  //
+  BOOLEAN                              UseRamfb;
+  FRAME_BUFFER_CONFIGURE               *QemuRamfbFrameBufferBltConfigure;
+  UINTN                                QemuRamfbFrameBufferBltConfigureSize;
+  FIRMWARE_CONFIG_ITEM                 RamfbFwCfgItem;
 };
 
 //

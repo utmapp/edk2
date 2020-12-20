@@ -50,6 +50,204 @@ STATIC CONST ACPI_ADR_DEVICE_PATH  mAcpiAdr = {
 };
 
 //
+// Macro for casting VGPU_GOP.Gop to VGPU_GOP.
+//
+#define VGPU_GOP_FROM_GOP(GopPointer) \
+          CR (GopPointer, VGPU_GOP, Gop, VGPU_GOP_SIG)
+
+#define RAMFB_FORMAT  0x34325258 /* DRM_FORMAT_XRGB8888 */
+#define RAMFB_BPP     4
+
+#pragma pack (1)
+typedef struct RAMFB_CONFIG {
+  UINT64 Address;
+  UINT32 FourCC;
+  UINT32 Flags;
+  UINT32 Width;
+  UINT32 Height;
+  UINT32 Stride;
+} RAMFB_CONFIG;
+#pragma pack ()
+
+STATIC EFI_GRAPHICS_OUTPUT_MODE_INFORMATION mQemuRamfbModeInfo[] = {
+  {
+    0,    // Version
+    640,  // HorizontalResolution
+    480,  // VerticalResolution
+  },{
+    0,    // Version
+    800,  // HorizontalResolution
+    600,  // VerticalResolution
+  },{
+    0,    // Version
+    1024, // HorizontalResolution
+    768,  // VerticalResolution
+  }
+};
+
+STATIC
+EFI_STATUS
+EFIAPI
+QemuRamfbGraphicsOutputQueryMode (
+  IN  EFI_GRAPHICS_OUTPUT_PROTOCOL          *This,
+  IN  UINT32                                ModeNumber,
+  OUT UINTN                                 *SizeOfInfo,
+  OUT EFI_GRAPHICS_OUTPUT_MODE_INFORMATION  **Info
+  )
+{
+  VGPU_GOP                              *VgpuGop;
+  EFI_GRAPHICS_OUTPUT_MODE_INFORMATION  *ModeInfo;
+
+  VgpuGop = VGPU_GOP_FROM_GOP (This);
+  if (Info == NULL || SizeOfInfo == NULL ||
+      ModeNumber >= VgpuGop->GopMode.MaxMode) {
+    return EFI_INVALID_PARAMETER;
+  }
+  ModeInfo = &mQemuRamfbModeInfo[ModeNumber];
+
+  *Info = AllocateCopyPool (sizeof (EFI_GRAPHICS_OUTPUT_MODE_INFORMATION),
+            ModeInfo);
+  if (*Info == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+  *SizeOfInfo = sizeof (EFI_GRAPHICS_OUTPUT_MODE_INFORMATION);
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+QemuRamfbGraphicsOutputSetMode (
+  IN  EFI_GRAPHICS_OUTPUT_PROTOCOL *This,
+  IN  UINT32                       ModeNumber
+  )
+{
+  VGPU_GOP                              *VgpuGop;
+  EFI_GRAPHICS_OUTPUT_MODE_INFORMATION  *ModeInfo;
+  RAMFB_CONFIG                          Config;
+  EFI_GRAPHICS_OUTPUT_BLT_PIXEL         Black;
+  RETURN_STATUS                         Status;
+
+  VgpuGop = VGPU_GOP_FROM_GOP (This);
+  if (ModeNumber >= VgpuGop->GopMode.MaxMode) {
+    return EFI_UNSUPPORTED;
+  }
+  ModeInfo = &mQemuRamfbModeInfo[ModeNumber];
+
+  DEBUG ((DEBUG_INFO, "Ramfb: SetMode %u (%ux%u)\n", ModeNumber,
+    ModeInfo->HorizontalResolution, ModeInfo->VerticalResolution));
+
+  Config.Address = SwapBytes64 (VgpuGop->GopMode.FrameBufferBase);
+  Config.FourCC  = SwapBytes32 (RAMFB_FORMAT);
+  Config.Flags   = SwapBytes32 (0);
+  Config.Width   = SwapBytes32 (ModeInfo->HorizontalResolution);
+  Config.Height  = SwapBytes32 (ModeInfo->VerticalResolution);
+  Config.Stride  = SwapBytes32 (ModeInfo->HorizontalResolution * RAMFB_BPP);
+
+  Status = FrameBufferBltConfigure (
+             (VOID*)(UINTN)VgpuGop->GopMode.FrameBufferBase,
+             ModeInfo,
+             VgpuGop->QemuRamfbFrameBufferBltConfigure,
+             &VgpuGop->QemuRamfbFrameBufferBltConfigureSize
+             );
+
+  if (Status == RETURN_BUFFER_TOO_SMALL) {
+    if (VgpuGop->QemuRamfbFrameBufferBltConfigure != NULL) {
+      FreePool (VgpuGop->QemuRamfbFrameBufferBltConfigure);
+    }
+   VgpuGop->QemuRamfbFrameBufferBltConfigure =
+      AllocatePool (VgpuGop->QemuRamfbFrameBufferBltConfigureSize);
+    if (VgpuGop->QemuRamfbFrameBufferBltConfigure == NULL) {
+      VgpuGop->QemuRamfbFrameBufferBltConfigureSize = 0;
+      return EFI_OUT_OF_RESOURCES;
+    }
+
+    Status = FrameBufferBltConfigure (
+               (VOID*)(UINTN)VgpuGop->GopMode.FrameBufferBase,
+               ModeInfo,
+               VgpuGop->QemuRamfbFrameBufferBltConfigure,
+               &VgpuGop->QemuRamfbFrameBufferBltConfigureSize
+               );
+  }
+  if (RETURN_ERROR (Status)) {
+    ASSERT (Status == RETURN_UNSUPPORTED);
+    return Status;
+  }
+
+  VgpuGop->GopMode.Mode = ModeNumber;
+  VgpuGop->GopMode.Info = ModeInfo;
+  VgpuGop->GopMode.SizeOfInfo = sizeof VgpuGop->GopModeInfo;
+  VgpuGop->Gop.Mode = &VgpuGop->GopMode;
+
+  QemuFwCfgSelectItem (VgpuGop->RamfbFwCfgItem);
+  QemuFwCfgWriteBytes (sizeof (Config), &Config);
+
+  //
+  // clear screen
+  //
+  ZeroMem (&Black, sizeof (Black));
+  Status = FrameBufferBlt (
+             VgpuGop->QemuRamfbFrameBufferBltConfigure,
+             &Black,
+             EfiBltVideoFill,
+             0,                               // SourceX -- ignored
+             0,                               // SourceY -- ignored
+             0,                               // DestinationX
+             0,                               // DestinationY
+             ModeInfo->HorizontalResolution,  // Width
+             ModeInfo->VerticalResolution,    // Height
+             0                                // Delta -- ignored
+             );
+  if (RETURN_ERROR (Status)) {
+    DEBUG ((DEBUG_WARN, "%a: clearing the screen failed: %r\n",
+      __FUNCTION__, Status));
+  }
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+QemuRamfbGraphicsOutputBlt (
+  IN  EFI_GRAPHICS_OUTPUT_PROTOCOL          *This,
+  IN  EFI_GRAPHICS_OUTPUT_BLT_PIXEL         *BltBuffer, OPTIONAL
+  IN  EFI_GRAPHICS_OUTPUT_BLT_OPERATION     BltOperation,
+  IN  UINTN                                 SourceX,
+  IN  UINTN                                 SourceY,
+  IN  UINTN                                 DestinationX,
+  IN  UINTN                                 DestinationY,
+  IN  UINTN                                 Width,
+  IN  UINTN                                 Height,
+  IN  UINTN                                 Delta
+  )
+{
+  VGPU_GOP *VgpuGop;
+
+  VgpuGop = VGPU_GOP_FROM_GOP (This);
+  return FrameBufferBlt (
+           VgpuGop->QemuRamfbFrameBufferBltConfigure,
+           BltBuffer,
+           BltOperation,
+           SourceX,
+           SourceY,
+           DestinationX,
+           DestinationY,
+           Width,
+           Height,
+           Delta
+           );
+}
+
+STATIC CONST EFI_GRAPHICS_OUTPUT_PROTOCOL mQemuRamfbGraphicsOutput = {
+  QemuRamfbGraphicsOutputQueryMode,
+  QemuRamfbGraphicsOutputSetMode,
+  QemuRamfbGraphicsOutputBlt,
+  NULL,
+};
+
+//
 // Component Name 2 Protocol implementation.
 //
 STATIC CONST EFI_UNICODE_STRING_TABLE  mDriverNameTable[] = {
@@ -279,6 +477,187 @@ FormatVgpuDevName (
   return EFI_SUCCESS;
 }
 
+STATIC
+EFI_STATUS
+EFIAPI
+InitQemuRamfbGop (
+  IN OUT VGPU_DEV                 *ParentBus,
+  IN     EFI_DEVICE_PATH_PROTOCOL *ParentDevicePath,
+  IN     EFI_HANDLE               ParentBusController,
+  IN     EFI_HANDLE               DriverBindingHandle
+  )
+{
+  VGPU_GOP                  *VgpuGop;
+  EFI_STATUS                Status;
+  CHAR16                    *ParentBusName;
+  STATIC CONST CHAR16       NameSuffix[] = L" RAMFB Head #0";
+  UINTN                     NameSize;
+  CHAR16                    *Name;
+  VOID                      *ParentVirtIo;
+  FIRMWARE_CONFIG_ITEM      RamfbFwCfgItem;
+  EFI_PHYSICAL_ADDRESS      FbBase;
+  UINTN                     FbSize, MaxFbSize, Pages;
+  UINTN                     FwCfgSize;
+  UINTN                     Index;
+
+  if (!QemuFwCfgIsAvailable ()) {
+    DEBUG ((DEBUG_INFO, "Ramfb: no FwCfg\n"));
+    return EFI_NOT_FOUND;
+  }
+
+  Status = QemuFwCfgFindFile ("etc/ramfb", &RamfbFwCfgItem, &FwCfgSize);
+  if (EFI_ERROR (Status)) {
+    return EFI_NOT_FOUND;
+  }
+  if (FwCfgSize != sizeof (RAMFB_CONFIG)) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: FwCfg size mismatch (expected %lu, got %lu)\n",
+      (UINT64)sizeof (RAMFB_CONFIG), (UINT64)FwCfgSize));
+    return EFI_PROTOCOL_ERROR;
+  }
+
+  MaxFbSize = 0;
+  for (Index = 0; Index < ARRAY_SIZE (mQemuRamfbModeInfo); Index++) {
+    mQemuRamfbModeInfo[Index].PixelsPerScanLine =
+      mQemuRamfbModeInfo[Index].HorizontalResolution;
+    mQemuRamfbModeInfo[Index].PixelFormat =
+      PixelBlueGreenRedReserved8BitPerColor;
+    FbSize = RAMFB_BPP *
+      mQemuRamfbModeInfo[Index].HorizontalResolution *
+      mQemuRamfbModeInfo[Index].VerticalResolution;
+    if (MaxFbSize < FbSize) {
+      MaxFbSize = FbSize;
+    }
+    DEBUG ((DEBUG_INFO, "Ramfb: Mode %lu: %ux%u, %lu kB\n", (UINT64)Index,
+      mQemuRamfbModeInfo[Index].HorizontalResolution,
+      mQemuRamfbModeInfo[Index].VerticalResolution,
+      (UINT64)(FbSize / 1024)));
+  }
+
+  VgpuGop = AllocateZeroPool (sizeof *VgpuGop);
+  if (VgpuGop == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  VgpuGop->Signature = VGPU_GOP_SIG;
+  VgpuGop->ParentBus = ParentBus;
+  VgpuGop->UseRamfb = TRUE;
+  VgpuGop->RamfbFwCfgItem = RamfbFwCfgItem;
+
+  Pages = EFI_SIZE_TO_PAGES (MaxFbSize);
+  MaxFbSize = EFI_PAGES_TO_SIZE (Pages);
+  FbBase = (EFI_PHYSICAL_ADDRESS)(UINTN)AllocateReservedPages (Pages);
+  if (FbBase == 0) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: memory allocation failed\n"));
+    Status = EFI_OUT_OF_RESOURCES;
+    goto FreeVgpuGop;
+  }
+  DEBUG ((DEBUG_INFO, "Ramfb: Framebuffer at 0x%lx, %lu kB, %lu pages\n",
+    (UINT64)FbBase, (UINT64)(MaxFbSize / 1024), (UINT64)Pages));
+  VgpuGop->GopMode.FrameBufferSize = MaxFbSize;
+  VgpuGop->GopMode.FrameBufferBase = FbBase;
+  VgpuGop->GopMode.MaxMode = ARRAY_SIZE (mQemuRamfbModeInfo);
+
+  //
+  // Format a human-readable controller name for VGPU_GOP, and stash it for
+  // VirtioGpuGetControllerName() to look up. We simply append NameSuffix to
+  // ParentBus->BusName.
+  //
+  Status = LookupUnicodeString2 ("en", mComponentName2.SupportedLanguages,
+             ParentBus->BusName, &ParentBusName, FALSE /* Iso639Language */);
+  ASSERT_EFI_ERROR (Status);
+  NameSize = StrSize (ParentBusName) - sizeof (CHAR16) + sizeof NameSuffix;
+  Name = AllocatePool (NameSize);
+  if (Name == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto FreeFramebuffer;
+  }
+  UnicodeSPrintAsciiFormat (Name, NameSize, "%s%s", ParentBusName, NameSuffix);
+  Status = AddUnicodeString2 ("en", mComponentName2.SupportedLanguages,
+             &VgpuGop->GopName, Name, FALSE /* Iso639Language */);
+  FreePool (Name);
+  if (EFI_ERROR (Status)) {
+    goto FreeFramebuffer;
+  }
+
+  //
+  // Create the child device path.
+  //
+  VgpuGop->GopDevicePath = AppendDevicePathNode (ParentDevicePath,
+                             &mAcpiAdr.Header);
+  if (VgpuGop->GopDevicePath == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto FreeVgpuGopName;
+  }
+
+  //
+  // Create the child handle with the child device path.
+  //
+  Status = gBS->InstallProtocolInterface (&VgpuGop->GopHandle,
+                  &gEfiDevicePathProtocolGuid, EFI_NATIVE_INTERFACE,
+                  VgpuGop->GopDevicePath);
+  if (EFI_ERROR (Status)) {
+    goto FreeDevicePath;
+  }
+
+  //
+  // The child handle must present a reference to the parent handle's Virtio
+  // Device Protocol interface.
+  //
+  Status = gBS->OpenProtocol (ParentBusController, &gVirtioDeviceProtocolGuid,
+                  &ParentVirtIo, DriverBindingHandle, VgpuGop->GopHandle,
+                  EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER);
+  if (EFI_ERROR (Status)) {
+    goto UninstallDevicePath;
+  }
+  ASSERT (ParentVirtIo == ParentBus->VirtIo);
+
+  //
+  // Initialize our Graphics Output Protocol.
+  //
+  // Fill in the function members of VgpuGop->Gop from the template, then set
+  // up the rest of the GOP infrastructure by calling SetMode() right now.
+  //
+  CopyMem (&VgpuGop->Gop, &mQemuRamfbGraphicsOutput,
+           sizeof mQemuRamfbGraphicsOutput);
+  Status = VgpuGop->Gop.SetMode (&VgpuGop->Gop, 1);
+  if (EFI_ERROR (Status)) {
+    goto CloseVirtIoByChild;
+  }
+
+  //
+  // Install the Graphics Output Protocol on the child handle.
+  //
+  Status = gBS->InstallProtocolInterface (&VgpuGop->GopHandle,
+                  &gEfiGraphicsOutputProtocolGuid, EFI_NATIVE_INTERFACE,
+                  &VgpuGop->Gop);
+  if (EFI_ERROR (Status)) {
+    goto CloseVirtIoByChild;
+  }
+
+  //
+  // We're done.
+  //
+  ParentBus->Child = VgpuGop;
+  return EFI_SUCCESS;
+
+CloseVirtIoByChild:
+  gBS->CloseProtocol (ParentBusController, &gVirtioDeviceProtocolGuid,
+    DriverBindingHandle, VgpuGop->GopHandle);
+
+UninstallDevicePath:
+  gBS->UninstallProtocolInterface (VgpuGop->GopHandle,
+         &gEfiDevicePathProtocolGuid, VgpuGop->GopDevicePath);
+FreeDevicePath:
+  FreePool (VgpuGop->GopDevicePath);
+FreeVgpuGopName:
+  FreeUnicodeStringTable (VgpuGop->GopName);
+FreeFramebuffer:
+  FreePages ((VOID*)(UINTN)VgpuGop->GopMode.FrameBufferBase, Pages);
+FreeVgpuGop:
+  FreePool (VgpuGop);
+  return Status;
+}
+
 /**
   Dynamically allocate and initialize the VGPU_GOP child object within an
   otherwise configured parent VGPU_DEV object.
@@ -482,6 +861,51 @@ FreeVgpuGop:
   FreePool (VgpuGop);
 
   return Status;
+}
+
+STATIC
+VOID
+UninitQemuRamfbGop (
+  IN OUT VGPU_DEV   *ParentBus,
+  IN     EFI_HANDLE ParentBusController,
+  IN     EFI_HANDLE DriverBindingHandle
+  )
+{
+  VGPU_GOP   *VgpuGop;
+  UINTN      Pages;
+  EFI_STATUS Status;
+
+  ASSERT (!VgpuGop->UseRamfb);
+
+  VgpuGop = ParentBus->Child;
+  Status = gBS->UninstallProtocolInterface (VgpuGop->GopHandle,
+                  &gEfiGraphicsOutputProtocolGuid, &VgpuGop->Gop);
+  ASSERT_EFI_ERROR (Status);
+
+  Status = gBS->CloseProtocol (ParentBusController, &gVirtioDeviceProtocolGuid,
+                  DriverBindingHandle, VgpuGop->GopHandle);
+  ASSERT_EFI_ERROR (Status);
+
+  Status = gBS->UninstallProtocolInterface (VgpuGop->GopHandle,
+                  &gEfiDevicePathProtocolGuid, VgpuGop->GopDevicePath);
+  ASSERT_EFI_ERROR (Status);
+
+  FreePool (VgpuGop->GopDevicePath);
+  FreeUnicodeStringTable (VgpuGop->GopName);
+  Pages = EFI_SIZE_TO_PAGES (VgpuGop->GopMode.FrameBufferSize);
+  FreePages ((VOID*)(UINTN)VgpuGop->GopMode.FrameBufferBase, Pages);
+  FreePool (VgpuGop);
+
+  ParentBus->Child = NULL;
+
+  // restore VGPU
+  Status = VirtioGpuInit (ParentBus);
+  ASSERT_EFI_ERROR (Status);
+
+  Status = gBS->CreateEvent (EVT_SIGNAL_EXIT_BOOT_SERVICES, TPL_CALLBACK,
+                  VirtioGpuExitBoot, ParentBus /* NotifyContext */,
+                  &ParentBus->ExitBoot);
+  ASSERT_EFI_ERROR (Status);
 }
 
 /**
@@ -832,6 +1256,16 @@ VirtioGpuDriverBindingStart (
     RemainingDevicePath == NULL || !IsDevicePathEnd (RemainingDevicePath)
     );
 
+  Status = InitQemuRamfbGop (VgpuDev, DevicePath, ControllerHandle,
+             This->DriverBindingHandle);
+  if (!EFI_ERROR (Status)) {
+    if (VirtIoBoundJustNow) {
+      gBS->CloseEvent (VgpuDev->ExitBoot);
+      VirtioGpuUninit (VgpuDev);
+    }
+    return EFI_SUCCESS;
+  }
+
   Status = InitVgpuGop (
              VgpuDev,
              DevicePath,
@@ -1013,7 +1447,11 @@ VirtioGpuDriverBindingStop (
         __func__,
         (VOID *)VgpuDev->VirtIo
         ));
-      UninitVgpuGop (VgpuDev, ControllerHandle, This->DriverBindingHandle);
+      if (VgpuDev->Child->UseRamfb) {
+        UninitQemuRamfbGop (VgpuDev, ControllerHandle, This->DriverBindingHandle);
+      } else {
+        UninitVgpuGop (VgpuDev, ControllerHandle, This->DriverBindingHandle);
+      }
       break;
 
     default:

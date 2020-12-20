@@ -38,6 +38,8 @@
   UefiDriverEntryPoint
   UefiLib
   VirtioLib
+  FrameBufferBltLib
+  QemuFwCfgLib
 
 [Protocols]
   gEfiDevicePathProtocolGuid     ## TO_START ## BY_START
