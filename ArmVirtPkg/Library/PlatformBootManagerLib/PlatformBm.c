@@ -833,6 +833,11 @@ PlatformBootManagerAfterConsole (
   }
 
   //
+  // Wait a second for QEMU to reset USB
+  //
+  gBS->Stall (1 * 1000 * 1000);
+
+  //
   // Enumerate all possible boot options, then filter and reorder them based on
   // the QEMU configuration.
   //
