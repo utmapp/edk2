@@ -18,6 +18,9 @@
 #include <Protocol/DevicePath.h>
 #include <Protocol/DriverBinding.h>
 #include <Protocol/PciIo.h>
+#include <PiDxe.h>
+#include <Library/DxeServicesTableLib.h>
+#include <Library/BaseLib.h>
 
 #include "VirtioGpu.h"
 
@@ -59,7 +62,6 @@ STATIC CONST ACPI_ADR_DEVICE_PATH mAcpiAdr = {
 
 #pragma pack (1)
 typedef struct RAMFB_CONFIG {
-  UINT64 Address;
   UINT32 FourCC;
   UINT32 Flags;
   UINT32 Width;
@@ -137,7 +139,6 @@ QemuRamfbGraphicsOutputSetMode (
   DEBUG ((DEBUG_INFO, "Ramfb: SetMode %u (%ux%u)\n", ModeNumber,
     ModeInfo->HorizontalResolution, ModeInfo->VerticalResolution));
 
-  Config.Address = SwapBytes64 (VgpuGop->GopMode.FrameBufferBase);
   Config.FourCC  = SwapBytes32 (RAMFB_FORMAT);
   Config.Flags   = SwapBytes32 (0);
   Config.Width   = SwapBytes32 (ModeInfo->HorizontalResolution);
@@ -368,24 +369,15 @@ STATIC CONST EFI_COMPONENT_NAME2_PROTOCOL mComponentName2 = {
 STATIC
 EFI_STATUS
 FormatVgpuDevName (
-  IN  EFI_HANDLE               ControllerHandle,
-  IN  EFI_HANDLE               AgentHandle,
-  IN  EFI_DEVICE_PATH_PROTOCOL *DevicePath,
+  IN  EFI_PCI_IO_PROTOCOL      *PciIo,
   OUT CHAR16                   **ControllerName
   )
 {
-  EFI_HANDLE          PciIoHandle;
-  EFI_PCI_IO_PROTOCOL *PciIo;
   UINTN               Segment, Bus, Device, Function;
   STATIC CONST CHAR16 ControllerNameStem[] = L"Virtio GPU Device";
   UINTN               ControllerNameSize;
 
-  if (EFI_ERROR (gBS->LocateDevicePath (&gEfiPciIoProtocolGuid, &DevicePath,
-                        &PciIoHandle)) ||
-      EFI_ERROR (gBS->OpenProtocol (PciIoHandle, &gEfiPciIoProtocolGuid,
-                        (VOID **)&PciIo, AgentHandle, ControllerHandle,
-                        EFI_OPEN_PROTOCOL_GET_PROTOCOL)) ||
-      EFI_ERROR (PciIo->GetLocation (PciIo, &Segment, &Bus, &Device,
+  if (EFI_ERROR (PciIo->GetLocation (PciIo, &Segment, &Bus, &Device,
                           &Function))) {
     //
     // Failed to retrieve location info, return verbatim copy of static string.
@@ -417,6 +409,88 @@ FormatVgpuDevName (
 STATIC
 EFI_STATUS
 EFIAPI
+AllocateRamfbFromBar (
+  IN  EFI_PCI_IO_PROTOCOL      *PciIo,
+  IN  UINTN                     MaxFbSize,
+  OUT EFI_PHYSICAL_ADDRESS     *FbBase
+  )
+{
+  EFI_STATUS                            Status;
+  EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR     *FrameBufDesc;
+  UINTN                                 BitsOfAlignment;
+
+  Status = PciIo->GetBarAttributes (
+                        PciIo,
+                        0,
+                        NULL,
+                        (VOID**) &FrameBufDesc
+                        );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: BAR read failed\n"));
+    return Status;
+  }
+  *FbBase = FrameBufDesc->AddrRangeMin;
+  BitsOfAlignment = LowBitSet64 (FrameBufDesc->AddrRangeMax + 1);
+  if (MaxFbSize > FrameBufDesc->AddrLen) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: VRAM not large enough to handle all modes\n"));
+    Status = EFI_OUT_OF_RESOURCES;
+    return Status;
+  }
+  Status = gDS->FreeMemorySpace (
+                  FrameBufDesc->AddrRangeMin,
+                  FrameBufDesc->AddrLen
+                  );
+  if (EFI_ERROR (Status) && Status != EFI_NOT_FOUND) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: failed to free PCI host bridge memory mapping: %r\n", Status));
+    return Status;
+  }
+  Status = gDS->RemoveMemorySpace (
+                  FrameBufDesc->AddrRangeMin,
+                  FrameBufDesc->AddrLen
+                  );
+  if (EFI_ERROR (Status) && Status != EFI_NOT_FOUND) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: failed to remove PCI host bridge memory mapping: %r\n", Status));
+    return Status;
+  }
+  Status = gDS->AddMemorySpace (
+                  EfiGcdMemoryTypeMemoryMappedIo,
+                  FrameBufDesc->AddrRangeMin,
+                  FrameBufDesc->AddrLen,
+                  EFI_MEMORY_WB
+                  );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: failed to add memory space: %r\n", Status));
+    return Status;
+  }
+  Status = gDS->SetMemorySpaceAttributes (
+                  FrameBufDesc->AddrRangeMin,
+                  FrameBufDesc->AddrLen,
+                  EFI_MEMORY_WB
+                  );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: failed to set framebuffer attributes: %r\n", Status));
+    return Status;
+  }
+  *FbBase = FrameBufDesc->AddrRangeMin;
+  Status = gDS->AllocateMemorySpace (
+                  EfiGcdAllocateAddress,
+                  EfiGcdMemoryTypeMemoryMappedIo,
+                  BitsOfAlignment,
+                  FrameBufDesc->AddrLen,
+                  FbBase,
+                  gImageHandle,
+                  NULL
+                  );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "Ramfb: failed to allocate framebuffer: %r\n", Status));
+    return Status;
+  }
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
 InitQemuRamfbGop (
   IN OUT VGPU_DEV                 *ParentBus,
   IN     EFI_DEVICE_PATH_PROTOCOL *ParentDevicePath,
@@ -442,7 +516,7 @@ InitQemuRamfbGop (
     return EFI_NOT_FOUND;
   }
 
-  Status = QemuFwCfgFindFile ("etc/ramfb", &RamfbFwCfgItem, &FwCfgSize);
+  Status = QemuFwCfgFindFile ("etc/virtio-ramfb", &RamfbFwCfgItem, &FwCfgSize);
   if (EFI_ERROR (Status)) {
     return EFI_NOT_FOUND;
   }
@@ -482,10 +556,8 @@ InitQemuRamfbGop (
 
   Pages = EFI_SIZE_TO_PAGES (MaxFbSize);
   MaxFbSize = EFI_PAGES_TO_SIZE (Pages);
-  FbBase = (EFI_PHYSICAL_ADDRESS)(UINTN)AllocateReservedPages (Pages);
-  if (FbBase == 0) {
-    DEBUG ((DEBUG_ERROR, "Ramfb: memory allocation failed\n"));
-    Status = EFI_OUT_OF_RESOURCES;
+  Status = AllocateRamfbFromBar (ParentBus->PciIo, MaxFbSize, &FbBase);
+  if (EFI_ERROR (Status)) {
     goto FreeVgpuGop;
   }
   DEBUG ((DEBUG_INFO, "Ramfb: Framebuffer at 0x%lx, %lu kB, %lu pages\n",
@@ -971,6 +1043,8 @@ VirtioGpuDriverBindingStart (
   BOOLEAN                  VirtIoBoundJustNow;
   VGPU_DEV                 *VgpuDev;
   EFI_DEVICE_PATH_PROTOCOL *DevicePath;
+  EFI_DEVICE_PATH_PROTOCOL *DevicePath2;
+  EFI_HANDLE               PciIoHandle;
 
   //
   // Open the Virtio Device Protocol.
@@ -1027,6 +1101,22 @@ VirtioGpuDriverBindingStart (
     goto FreeVgpuDev;
   }
 
+  if (VirtIoBoundJustNow) {
+    DevicePath2 = DevicePath;
+    Status = gBS->LocateDevicePath (&gEfiPciIoProtocolGuid, &DevicePath2,
+                        &PciIoHandle);
+    if (EFI_ERROR (Status)) {
+      goto FreeVgpuDev;
+    }
+
+    Status = gBS->OpenProtocol (PciIoHandle, &gEfiPciIoProtocolGuid,
+                        (VOID **)&VgpuDev->PciIo, This->DriverBindingHandle,
+                        ControllerHandle, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+    if (EFI_ERROR (Status)) {
+      goto FreeVgpuDev;
+    }
+  }
+
   //
   // Create VGPU_DEV if we've bound the VirtIo controller right now (that is,
   // if we aren't *only* creating child handles).
@@ -1038,8 +1128,7 @@ VirtioGpuDriverBindingStart (
     // Format a human-readable controller name for VGPU_DEV, and stash it for
     // VirtioGpuGetControllerName() to look up.
     //
-    Status = FormatVgpuDevName (ControllerHandle, This->DriverBindingHandle,
-               DevicePath, &VgpuDevName);
+    Status = FormatVgpuDevName (VgpuDev->PciIo, &VgpuDevName);
     if (EFI_ERROR (Status)) {
       goto FreeVgpuDev;
     }

@@ -19,6 +19,7 @@
 #include <Library/UefiLib.h>
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/VirtioDevice.h>
+#include <Protocol/PciIo.h>
 
 //
 // Forward declaration of VGPU_GOP.
@@ -41,6 +42,11 @@ typedef struct {
   // VirtIo represents access to the Virtio GPU device. Never NULL.
   //
   VIRTIO_DEVICE_PROTOCOL   *VirtIo;
+
+  //
+  // PCI protocol for ramfb operations.
+  //
+  EFI_PCI_IO_PROTOCOL *PciIo;
 
   //
   // BusName carries a customized name for
