@@ -170,6 +170,9 @@ READ_LOCK_STATUS   = TRUE
   INF OvmfPkg/QemuRamfbDxe/QemuRamfbDxe.inf
   INF OvmfPkg/VirtioGpuDxe/VirtioGpu.inf
   INF OvmfPkg/PlatformDxe/Platform.inf
+!ifndef $(CSM_ENABLE)
+  INF OvmfPkg/QemuVideoDxe/QemuVideoDxe.inf
+!endif
 
   #
   # USB Support

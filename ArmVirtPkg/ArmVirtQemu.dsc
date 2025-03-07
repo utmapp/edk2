@@ -495,6 +495,9 @@
   OvmfPkg/QemuRamfbDxe/QemuRamfbDxe.inf
   OvmfPkg/VirtioGpuDxe/VirtioGpu.inf
   OvmfPkg/PlatformDxe/Platform.inf
+!ifndef $(CSM_ENABLE)
+  OvmfPkg/QemuVideoDxe/QemuVideoDxe.inf
+!endif
 
   #
   # USB Support
